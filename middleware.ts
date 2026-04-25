@@ -1,1 +1,1 @@
-// intentionally empty - using proxy.ts instead
+// deprecated - replaced by proxy.ts
