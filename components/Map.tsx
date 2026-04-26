@@ -27,6 +27,7 @@ export default function Map({ events, flyTo }: Props) {
   const mapContainerRef = useRef<HTMLDivElement>(null)
   const markersRef = useRef<L.Marker[]>([])
   const [tooltip, setTooltip] = useState<{ event: Event; x: number; y: number } | null>(null)
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return
@@ -38,7 +39,6 @@ export default function Map({ events, flyTo }: Props) {
     return () => { mapRef.current?.remove(); mapRef.current = null }
   }, [])
 
-  // Fly to location when triggered
   useEffect(() => {
     if (!flyTo || !mapRef.current) return
     mapRef.current.flyTo([flyTo.lat, flyTo.lng], flyTo.zoom, { duration: 1.2 })
@@ -71,11 +71,14 @@ export default function Map({ events, flyTo }: Props) {
       const marker = L.marker([event.lat, event.lng], { icon }).addTo(mapRef.current!)
 
       marker.on('mouseover', () => {
+        if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
         const containerPoint = mapRef.current!.latLngToContainerPoint([event.lat, event.lng])
         setTooltip({ event, x: containerPoint.x, y: containerPoint.y })
       })
-      marker.on('mouseout', () => setTooltip(null))
-      marker.on('click', () => window.open(event.ticketUrl, '_blank'))
+
+      marker.on('mouseout', () => {
+        hideTimerRef.current = setTimeout(() => setTooltip(null), 300)
+      })
 
       markersRef.current.push(marker)
     })
@@ -88,39 +91,99 @@ export default function Map({ events, flyTo }: Props) {
       + (time ? ` · ${d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}` : '')
   }
 
+  const getFlightDate = (eventDate: string) => {
+    if (!eventDate) return ''
+    const d = new Date(eventDate)
+    d.setDate(d.getDate() - 1)
+    return d.toISOString().split('T')[0].replace(/-/g, '')
+  }
+
+  const getGoogleFlightsUrl = (event: Event) => {
+    const flightDate = getFlightDate(event.eventDate)
+    const city = encodeURIComponent(event.venueCity)
+    return `https://www.google.com/travel/flights?q=Flights+to+${city}+on+${flightDate}`
+  }
+
+  const handleTooltipEnter = () => {
+    if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
+  }
+
+  const handleTooltipLeave = () => {
+    hideTimerRef.current = setTimeout(() => setTooltip(null), 200)
+  }
+
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       <div ref={mapContainerRef} style={{ width: '100%', height: '100%' }} />
+
       {tooltip && (
-        <div style={{
-          position: 'absolute',
-          left: tooltip.x + 24,
-          top: tooltip.y - 60,
-          background: '#1a1a1a',
-          border: '1px solid #444',
-          borderRadius: '10px',
-          padding: '12px',
-          width: '250px',
-          pointerEvents: 'none',
-          zIndex: 1000,
-          boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
-        }}>
-          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '8px' }}>
+        <div
+          onMouseEnter={handleTooltipEnter}
+          onMouseLeave={handleTooltipLeave}
+          style={{
+            position: 'absolute',
+            left: tooltip.x + 24,
+            top: tooltip.y - 60,
+            background: '#1a1a1a',
+            border: '1px solid #444',
+            borderRadius: '12px',
+            padding: '14px',
+            width: '270px',
+            zIndex: 1000,
+            boxShadow: '0 4px 24px rgba(0,0,0,0.7)',
+            cursor: 'default',
+          }}
+        >
+          {/* Artist header */}
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px' }}>
             {tooltip.event.artistImage && (
-              <img src={tooltip.event.artistImage} style={{ width: 40, height: 40, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }} />
+              <img src={tooltip.event.artistImage} style={{ width: 42, height: 42, borderRadius: '50%', objectFit: 'cover', flexShrink: 0, border: '2px solid #1DB954' }} />
             )}
             <div>
-              <div style={{ color: '#1DB954', fontWeight: '700', fontSize: '14px' }}>{tooltip.event.artistName}</div>
-              <div style={{ color: '#bbb', fontSize: '11px' }}>{tooltip.event.eventName}</div>
+              <div style={{ color: '#1DB954', fontWeight: '700', fontSize: '15px' }}>{tooltip.event.artistName}</div>
+              <div style={{ color: '#bbb', fontSize: '11px', marginTop: '2px' }}>{tooltip.event.eventName}</div>
             </div>
           </div>
-          <div style={{ color: '#e0e0e0', fontSize: '12px', marginBottom: '4px' }}>
-            📍 {tooltip.event.venueName ? `${tooltip.event.venueName}, ` : ''}{tooltip.event.venueCity}, {tooltip.event.venueCountry}
+
+          {/* Venue and date */}
+          <div style={{ borderTop: '1px solid #333', paddingTop: '10px', marginBottom: '12px' }}>
+            <div style={{ color: '#e0e0e0', fontSize: '12px', marginBottom: '5px', display: 'flex', gap: '6px' }}>
+              <span>📍</span>
+              <span>{tooltip.event.venueName ? `${tooltip.event.venueName}, ` : ''}{tooltip.event.venueCity}, {tooltip.event.venueCountry}</span>
+            </div>
+            <div style={{ color: '#e0e0e0', fontSize: '12px', display: 'flex', gap: '6px' }}>
+              <span>🗓</span>
+              <span>{formatDate(tooltip.event.eventDate, tooltip.event.eventTime)}</span>
+            </div>
           </div>
-          <div style={{ color: '#e0e0e0', fontSize: '12px', marginBottom: '8px' }}>
-            🗓 {formatDate(tooltip.event.eventDate, tooltip.event.eventTime)}
+
+          {/* Action buttons */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <a
+              href={tooltip.event.ticketUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+                background: '#1DB954', color: '#fff', textDecoration: 'none',
+                padding: '9px 14px', borderRadius: '8px', fontSize: '13px', fontWeight: '600',
+              }}
+            >
+              🎟 Buy Tickets
+            </a>
+            <a
+              href={getGoogleFlightsUrl(tooltip.event)}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+                background: '#1a73e8', color: '#fff', textDecoration: 'none',
+                padding: '9px 14px', borderRadius: '8px', fontSize: '13px', fontWeight: '600',
+              }}
+            >
+              ✈️ Find Flights
+            </a>
           </div>
-          <div style={{ color: '#1DB954', fontSize: '11px', fontWeight: '600' }}>Click to buy tickets →</div>
         </div>
       )}
     </div>
