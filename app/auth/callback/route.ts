@@ -2,20 +2,23 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createServerClient } from '@supabase/ssr'
 
 export async function GET(request: NextRequest) {
-  const { searchParams, origin } = new URL(request.url)
+  const { searchParams } = new URL(request.url)
   const code = searchParams.get('code')
   const error = searchParams.get('error')
   const errorDescription = searchParams.get('error_description')
 
-  console.log('Auth callback hit:', { code: !!code, error, errorDescription, url: request.url })
+  // Use the forwarded host header to get the public URL, fallback to request origin
+  const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000'
+  const proto = request.headers.get('x-forwarded-proto') || 'https'
+  const origin = `${proto}://${host}`
+
+  console.log('Auth callback hit:', { code: !!code, error, errorDescription, origin })
 
   if (error) {
-    console.error('OAuth error:', error, errorDescription)
     return NextResponse.redirect(`${origin}/login?error=${error}`)
   }
 
   if (!code) {
-    console.error('No code in callback')
     return NextResponse.redirect(`${origin}/login?error=no_code`)
   }
 
