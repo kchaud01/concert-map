@@ -1,9 +1,12 @@
 'use client'
-import { createClient } from '@/utils/supabase'
+import { createBrowserClient } from '@supabase/ssr'
 
 export default function LoginPage() {
   const handleLogin = async () => {
-    const supabase = createClient()
+    const supabase = createBrowserClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+    )
     await supabase.auth.signInWithOAuth({
       provider: 'spotify',
       options: {
