@@ -1,6 +1,8 @@
 import { createServerSupabaseClient } from '@/utils/supabase-server'
 import { NextRequest, NextResponse } from 'next/server'
 
+const CACHE_HOURS = 24
+
 export async function GET(request: NextRequest) {
   const supabase = await createServerSupabaseClient()
   const { data: { session } } = await supabase.auth.getSession()
@@ -12,6 +14,31 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
   const startDate = searchParams.get('startDate') || new Date().toISOString().split('T')[0]
   const endDate = searchParams.get('endDate') || new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+  const forceRefresh = searchParams.get('refresh') === 'true'
+  const userId = session.user.id
+
+  // Check cache first
+  if (!forceRefresh) {
+    const { data: cached } = await supabase
+      .from('event_cache')
+      .select('events, created_at')
+      .eq('user_id', userId)
+      .eq('start_date', startDate)
+      .eq('end_date', endDate)
+      .single()
+
+    if (cached) {
+      const cacheAge = (Date.now() - new Date(cached.created_at).getTime()) / (1000 * 60 * 60)
+      if (cacheAge < CACHE_HOURS) {
+        return NextResponse.json({ 
+          events: cached.events, 
+          total: cached.events.length,
+          cached: true,
+          cacheAge: Math.round(cacheAge * 10) / 10
+        })
+      }
+    }
+  }
 
   // Fetch followed artists from Spotify
   const accessToken = session.provider_token
@@ -24,33 +51,53 @@ export async function GET(request: NextRequest) {
         headers: { Authorization: `Bearer ${accessToken}` }
       })
       const data = await res.json()
-      if (!data.artists) {
-        return NextResponse.json({ error: 'Spotify fetch failed', detail: data, artistCount: 0 })
-      }
+      if (!data.artists) break
       artists = [...artists, ...data.artists.items]
       url = data.artists.next
     }
-  } catch (e: any) {
-    return NextResponse.json({ error: 'Spotify error', detail: e.message })
+  } catch (e) {
+    return NextResponse.json({ error: 'Spotify fetch failed' }, { status: 500 })
   }
 
   if (artists.length === 0) {
-    return NextResponse.json({ error: 'No artists found', events: [], total: 0 })
+    return NextResponse.json({ events: [], total: 0 })
   }
 
-  // Test one Ticketmaster call to verify API key works
+  // Check Ticketmaster rate limit with one test call
   const apiKey = process.env.TICKETMASTER_API_KEY
-  const testArtist = artists[0]
-  const testUrl = `https://app.ticketmaster.com/discovery/v2/events.json?apikey=${apiKey}&keyword=${encodeURIComponent(testArtist.name)}&classificationName=music&startDateTime=${startDate}T00:00:00Z&endDateTime=${endDate}T23:59:59Z&size=3`
+  const testRes = await fetch(
+    `https://app.ticketmaster.com/discovery/v2/events.json?apikey=${apiKey}&keyword=${encodeURIComponent(artists[0].name)}&size=1`
+  )
+  const testData = await testRes.json()
   
-  let testResult: any = null
-  try {
-    const testRes = await fetch(testUrl)
-    testResult = await testRes.json()
-  } catch (e: any) {
-    return NextResponse.json({ error: 'Ticketmaster error', detail: e.message })
+  if (testData?.fault?.faultstring?.includes('Rate limit')) {
+    // Return stale cache if available rather than empty
+    const { data: staleCache } = await supabase
+      .from('event_cache')
+      .select('events, created_at')
+      .eq('user_id', userId)
+      .eq('start_date', startDate)
+      .eq('end_date', endDate)
+      .single()
+
+    if (staleCache) {
+      return NextResponse.json({ 
+        events: staleCache.events, 
+        total: staleCache.events.length,
+        cached: true,
+        stale: true,
+        message: 'Ticketmaster rate limit reached — showing cached results'
+      })
+    }
+
+    return NextResponse.json({ 
+      events: [], 
+      total: 0, 
+      error: 'Ticketmaster rate limit reached. Please try again tomorrow.' 
+    })
   }
 
+  // Fetch events from Ticketmaster
   const results: any[] = []
   const batches = []
   for (let i = 0; i < artists.length; i += 5) {
@@ -103,6 +150,7 @@ export async function GET(request: NextRequest) {
     results.push(...batchResults.flat())
   }
 
+  // Deduplicate
   const seen = new Set<string>()
   const deduped = results.filter(event => {
     const key = `${event.artistName}|${event.eventDate}|${event.venueCity}`
@@ -111,17 +159,15 @@ export async function GET(request: NextRequest) {
     return true
   })
 
-  return NextResponse.json({ 
-    events: deduped, 
-    total: deduped.length,
-    debug: {
-      artistCount: artists.length,
-      firstArtist: testArtist.name,
-      ticketmasterStatus: testResult?.fault || testResult?._embedded ? 'ok' : 'check',
-      ticketmasterEvents: testResult?._embedded?.events?.length || 0,
-      ticketmasterError: testResult?.fault?.faultstring || null,
-      startDate,
-      endDate
-    }
-  })
+  // Save to cache
+  await supabase
+    .from('event_cache')
+    .upsert({
+      user_id: userId,
+      start_date: startDate,
+      end_date: endDate,
+      events: deduped,
+    }, { onConflict: 'user_id,start_date,end_date' })
+
+  return NextResponse.json({ events: deduped, total: deduped.length, cached: false })
 }
