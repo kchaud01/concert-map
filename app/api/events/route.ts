@@ -1,3 +1,4 @@
+// v2 - optimized: ~20 API calls instead of 233
 import { createServerSupabaseClient } from '@/utils/supabase-server'
 import { NextRequest, NextResponse } from 'next/server'
 
@@ -67,13 +68,12 @@ export async function GET(request: NextRequest) {
   const artistMap = new Map<string, any>()
   artists.forEach(a => {
     artistMap.set(a.name.toLowerCase(), a)
-    // Also index without "the " prefix
     const noThe = a.name.toLowerCase().replace(/^the\s+/, '')
     if (noThe !== a.name.toLowerCase()) artistMap.set(noThe, a)
   })
 
   // Fetch pages of ALL music events and filter locally
-  // This uses ~20 calls max instead of 233 calls (one per artist)
+  // ~20 calls max instead of one per artist
   const results: any[] = []
   const seen = new Set<string>()
   let page = 0
@@ -96,7 +96,6 @@ export async function GET(request: NextRequest) {
       const res = await fetch(tmUrl)
       const data = await res.json()
 
-      // Rate limit hit — return stale cache or error
       if (data?.fault?.faultstring?.includes('Rate limit')) {
         const { data: staleCache } = await supabase
           .from('event_cache')
@@ -134,7 +133,7 @@ export async function GET(request: NextRequest) {
 
         let matchedArtist: any = null
 
-        // Best match: exact attraction name
+        // Best: exact attraction name match
         for (const attraction of attractions) {
           const name = attraction.name?.toLowerCase()
           if (name && artistMap.has(name)) {
@@ -143,7 +142,7 @@ export async function GET(request: NextRequest) {
           }
         }
 
-        // Fallback: artist name contained in event name
+        // Fallback: artist name in event name
         if (!matchedArtist) {
           for (const [artistKey, artist] of artistMap.entries()) {
             if (artistKey.length > 3 && eventNameLower.includes(artistKey)) {
