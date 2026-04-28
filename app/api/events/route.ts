@@ -1,4 +1,4 @@
-// v2 - optimized: ~20 API calls instead of 233
+// v3 - per-artist search, limited to top 50 by popularity
 import { createServerSupabaseClient } from '@/utils/supabase-server'
 import { NextRequest, NextResponse } from 'next/server'
 
@@ -62,127 +62,83 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ events: [], total: 0 })
   }
 
+  // Sort by popularity and take top 100 to stay within rate limits
+  // 100 artists x 1 call each = 100 calls, well within 5000/day limit
+  const topArtists = [...artists]
+    .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
+    .slice(0, 100)
+
   const apiKey = process.env.TICKETMASTER_API_KEY
-
-  // Build lookup map: artist name lowercase -> artist object
-  const artistMap = new Map<string, any>()
-  artists.forEach(a => {
-    artistMap.set(a.name.toLowerCase(), a)
-    const noThe = a.name.toLowerCase().replace(/^the\s+/, '')
-    if (noThe !== a.name.toLowerCase()) artistMap.set(noThe, a)
-  })
-
-  // Fetch pages of ALL music events and filter locally
-  // ~20 calls max instead of one per artist
   const results: any[] = []
   const seen = new Set<string>()
-  let page = 0
-  let totalPages = 1
-  let callCount = 0
-  const MAX_PAGES = 20
 
-  while (page < totalPages && callCount < MAX_PAGES) {
-    const tmUrl =
-      `https://app.ticketmaster.com/discovery/v2/events.json` +
-      `?apikey=${apiKey}` +
-      `&classificationName=music` +
-      `&startDateTime=${startDate}T00:00:00Z` +
-      `&endDateTime=${endDate}T23:59:59Z` +
-      `&size=200` +
-      `&page=${page}` +
-      `&sort=date,asc`
+  function isStrongMatch(eventName: string, artistName: string): boolean {
+    const event = eventName.toLowerCase()
+    const artist = artistName.toLowerCase()
+    if (event === artist) return true
+    if (event.startsWith(artist)) return true
+    const artistNoThe = artist.replace(/^the\s+/, '')
+    if (event.includes(artistNoThe) && artistNoThe.length > 4) return true
+    const artistWords = artist.split(/\s+/).filter((w: string) => w.length > 2)
+    const allWordsMatch = artistWords.every((word: string) => event.includes(word))
+    if (allWordsMatch && artistWords.length > 0) return true
+    return false
+  }
 
-    try {
-      const res = await fetch(tmUrl)
-      const data = await res.json()
+  // Process in batches of 5 (parallel) to stay fast but not overwhelm
+  const batches = []
+  for (let i = 0; i < topArtists.length; i += 5) {
+    batches.push(topArtists.slice(i, i + 5))
+  }
 
-      if (data?.fault?.faultstring?.includes('Rate limit')) {
-        const { data: staleCache } = await supabase
-          .from('event_cache')
-          .select('events, created_at')
-          .eq('user_id', userId)
-          .eq('start_date', startDate)
-          .eq('end_date', endDate)
-          .single()
+  for (const batch of batches) {
+    const batchResults = await Promise.all(
+      batch.map(async (artist: any) => {
+        try {
+          const tmUrl =
+            `https://app.ticketmaster.com/discovery/v2/events.json` +
+            `?apikey=${apiKey}` +
+            `&keyword=${encodeURIComponent(artist.name)}` +
+            `&classificationName=music` +
+            `&startDateTime=${startDate}T00:00:00Z` +
+            `&endDateTime=${endDate}T23:59:59Z` +
+            `&size=5`
 
-        if (staleCache) {
-          return NextResponse.json({
-            events: staleCache.events,
-            total: staleCache.events.length,
-            cached: true,
-            stale: true,
-            message: 'Showing cached results — Ticketmaster rate limit reached'
-          })
+          const res = await fetch(tmUrl)
+          const data = await res.json()
+
+          if (data?.fault?.faultstring?.includes('Rate limit')) return []
+          if (!data._embedded?.events) return []
+
+          return data._embedded.events
+            .filter((event: any) => isStrongMatch(event.name, artist.name))
+            .map((event: any) => ({
+              artistName: artist.name,
+              artistImage: artist.images?.[0]?.url || null,
+              artistId: artist.id,
+              eventName: event.name,
+              eventDate: event.dates?.start?.localDate,
+              eventTime: event.dates?.start?.localTime,
+              venueName: event._embedded?.venues?.[0]?.name,
+              venueCity: event._embedded?.venues?.[0]?.city?.name,
+              venueCountry: event._embedded?.venues?.[0]?.country?.name,
+              lat: parseFloat(event._embedded?.venues?.[0]?.location?.latitude),
+              lng: parseFloat(event._embedded?.venues?.[0]?.location?.longitude),
+              ticketUrl: event.url,
+            }))
+            .filter((e: any) => e.lat && e.lng && !isNaN(e.lat) && !isNaN(e.lng))
+        } catch {
+          return []
         }
+      })
+    )
 
-        return NextResponse.json({
-          events: [],
-          total: 0,
-          error: 'Ticketmaster rate limit reached. Please try again later.'
-        })
+    for (const event of batchResults.flat()) {
+      const key = `${event.artistName}|${event.eventDate}|${event.venueCity}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        results.push(event)
       }
-
-      if (!data._embedded?.events) break
-
-      totalPages = Math.min(data.page?.totalPages || 1, MAX_PAGES)
-      callCount++
-
-      for (const event of data._embedded.events) {
-        const eventNameLower = event.name?.toLowerCase() || ''
-        const attractions = event._embedded?.attractions || []
-
-        let matchedArtist: any = null
-
-        // Best: exact attraction name match
-        for (const attraction of attractions) {
-          const name = attraction.name?.toLowerCase()
-          if (name && artistMap.has(name)) {
-            matchedArtist = artistMap.get(name)
-            break
-          }
-        }
-
-        // Fallback: artist name in event name
-        if (!matchedArtist) {
-          for (const [artistKey, artist] of artistMap.entries()) {
-            if (artistKey.length > 3 && eventNameLower.includes(artistKey)) {
-              matchedArtist = artist
-              break
-            }
-          }
-        }
-
-        if (!matchedArtist) continue
-
-        const lat = parseFloat(event._embedded?.venues?.[0]?.location?.latitude)
-        const lng = parseFloat(event._embedded?.venues?.[0]?.location?.longitude)
-        if (!lat || !lng || isNaN(lat) || isNaN(lng)) continue
-
-        const venueCity = event._embedded?.venues?.[0]?.city?.name
-        const eventDate = event.dates?.start?.localDate
-        const dedupKey = `${matchedArtist.name}|${eventDate}|${venueCity}`
-        if (seen.has(dedupKey)) continue
-        seen.add(dedupKey)
-
-        results.push({
-          artistName: matchedArtist.name,
-          artistImage: matchedArtist.images?.[0]?.url || null,
-          artistId: matchedArtist.id,
-          eventName: event.name,
-          eventDate,
-          eventTime: event.dates?.start?.localTime,
-          venueName: event._embedded?.venues?.[0]?.name,
-          venueCity,
-          venueCountry: event._embedded?.venues?.[0]?.country?.name,
-          lat,
-          lng,
-          ticketUrl: event.url,
-        })
-      }
-
-      page++
-    } catch (e) {
-      break
     }
   }
 
@@ -202,6 +158,7 @@ export async function GET(request: NextRequest) {
     events: results,
     total: results.length,
     cached: false,
-    callsUsed: callCount
+    artistsSearched: topArtists.length,
+    totalArtists: artists.length
   })
 }
